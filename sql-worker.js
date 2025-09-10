@@ -1,7 +1,7 @@
 require('dotenv').config();
 
 const { Worker } = require('bullmq');
-const connection = require('../lib/redis');
+const IORedis = require('ioredis');
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
@@ -9,6 +9,14 @@ const axios = require('axios');
 if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
   throw new Error('Supabase environment variables (URL and Service Role Key) are not set! Check your .env.local file.');
 }
+
+const connection = new IORedis(process.env.REDIS_URL, {
+  maxRetriesPerRequest: null, // Required by BullMQ
+});
+
+connection.on('connect', () => console.log('[Redis] Successfully connected to Redis.'));
+connection.on('error', (err) => console.error('[Redis] Connection Error:', err.message));
+
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
