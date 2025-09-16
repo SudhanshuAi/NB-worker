@@ -1,4 +1,4 @@
-// workers/sql-worker.js (For Azure VM Deployment)
+// workers/sql-worker.js (For Azure VM Deployment with MongoDB Logging)
 
 // Uses the standard dotenv for Node.js environments to load the .env file
 require('dotenv').config();
@@ -8,6 +8,7 @@ const IORedis = require('ioredis'); // Using ioredis directly for Azure
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { createClient } = require('@supabase/supabase-js');
 const axios = require('axios');
+const { MongoClient } = require('mongodb'); // ADDED: MongoDB driver
 
 // --- Environment Variable Validation ---
 if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
@@ -16,18 +17,19 @@ if (!process.env.NEXT_PUBLIC_SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_
 if (!process.env.REDIS_URL) {
     throw new Error('REDIS_URL is not set in the .env file!');
 }
+if (!process.env.MONGO_URI) { // ADDED: MongoDB URI validation
+  throw new Error('MONGO_URI is not set in the .env file!');
+}
 
 // --- Redis Connection for Azure ---
-// This connects directly to your local Redis container on the VM using the REDIS_URL.
 const connection = new IORedis(process.env.REDIS_URL, {
-    maxRetriesPerRequest: null, // Required by BullMQ for robust connections
+    maxRetriesPerRequest: null,
 });
-
 connection.on('connect', () => console.log('[Redis] Successfully connected to Redis.'));
 connection.on('error', (err) => console.error('[Redis] Connection Error:', err.message));
 
 
-// --- Client Initializations (Logic preserved) ---
+// --- Client Initializations ---
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
@@ -41,12 +43,28 @@ const s3Client = new S3Client({
   },
 });
 
+// ADDED: MongoDB Client Setup
+const mongoClient = new MongoClient(process.env.MONGO_URI);
+let mongoDb;
+async function connectToMongo() {
+  if (mongoDb) return mongoDb;
+  try {
+    await mongoClient.connect();
+    console.log('[MongoDB] Successfully connected to MongoDB.');
+    mongoDb = mongoClient.db("JobLogs"); // Using the DB name from your URI
+    return mongoDb;
+  } catch (e) {
+    console.error('[MongoDB] Connection failed:', e);
+    process.exit(1);
+  }
+}
+
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 
-// --- HELPER FUNCTIONS (Logic and syntax preserved exactly as provided) ---
-
+// --- HELPER FUNCTIONS (No changes to this section) ---
 const getDatabaseConfig = async (notebookId) => {
+  // ... (This function is unchanged)
   try {
     const { data: notebook, error } = await supabase
       .from('autonomis_user_notebook')
@@ -83,8 +101,8 @@ const getDatabaseConfig = async (notebookId) => {
 };
 
 const executeQuery = async (query, dbType, dbConfig, queryId) => {
+  // ... (This function is unchanged)
   try {
-    // IMPORTANT: Ensure your .env file on Azure sets one of these variables to your public Vercel URL.
     const baseUrl = process.env.API_BASE_URL || process.env.NEXT_PUBLIC_VERCEL_URL || 'http://localhost:3000';
 
     if (!process.env.WORKER_SECRET_KEY) {
@@ -127,8 +145,9 @@ const executeQuery = async (query, dbType, dbConfig, queryId) => {
 };
 
 
-// --- BULLMQ WORKER PROCESSOR (Logic and syntax preserved exactly as provided) ---
+// --- BULLMQ WORKER PROCESSOR (No changes to this section) ---
 const processor = async (job) => {
+  // ... (This function is unchanged)
   const { s3Key, notebookId } = job.data;
   const file_url = s3Key;
 
@@ -205,16 +224,41 @@ const processor = async (job) => {
 };
 
 
-// --- WORKER INITIALIZATION AND EVENT LISTENERS (Logic and syntax preserved exactly as provided) ---
+// --- WORKER INITIALIZATION AND EVENT LISTENERS ---
+
+// ADDED: New function to log details to MongoDB
+const logJobRunDetailsToMongo = async (job, result) => {
+  if (!job || !job.data.notebookId) {
+    console.log('[Logger] Skipping detailed log: job data is incomplete.');
+    return;
+  }
+  try {
+    const db = await connectToMongo();
+    const logCollection = db.collection('jobRunLogs');
+    const logDocument = {
+      jobId: job.id,
+      notebookId: job.data.notebookId,
+      status: result.status,
+      startedAt: new Date(job.timestamp),
+      finishedAt: new Date(job.finishedOn || Date.now()),
+      executionDetails: result.results,
+      createdAt: new Date(),
+    };
+    await logCollection.insertOne(logDocument);
+    console.log(`[Logger] Successfully saved detailed log for job ${job.id} to MongoDB.`);
+  } catch(e) {
+    console.error('[Logger] A critical error occurred during the MongoDB logging process:', e);
+  }
+};
+
 const updateMonitoringData = async (job, status) => {
+  // This existing function is unchanged
   if (!job || !job.data.notebookId) {
     console.log('[Monitoring] Skipping update: job data is incomplete.');
     return;
   }
-
   const { notebookId, notebookName } = job.data;
   console.log(`[Monitoring] Updating status for notebook ${notebookId} to "${status}".`);
-
   try {
     const { data: currentMonitoring, error: selectError } = await supabase
       .from('autonomis_job_monitoring')
@@ -226,14 +270,11 @@ const updateMonitoringData = async (job, status) => {
       console.error('[Monitoring] Error fetching current monitoring data:', selectError);
       return;
     }
-      
     let history = currentMonitoring?.run_history || [];
     history.unshift({ status: status, timestamp: new Date().toISOString() });
     const newHistory = history.slice(0, 5);
-    
     const successful_runs_last_5 = newHistory.filter(run => run.status === 'completed').length;
     const failed_runs_last_5 = newHistory.filter(run => run.status === 'failed').length;
-    
     const { error: upsertError } = await supabase
       .from('autonomis_job_monitoring')
       .upsert({
@@ -247,7 +288,6 @@ const updateMonitoringData = async (job, status) => {
         failed_runs_last_5: failed_runs_last_5,
         is_active: true,
       }, { onConflict: 'notebook_id' });
-  
     if (upsertError) {
       console.error('[Monitoring] Error upserting monitoring data:', upsertError);
     } else {
@@ -259,16 +299,25 @@ const updateMonitoringData = async (job, status) => {
 };
 
 console.log('[Worker] SQL Execution Worker is starting...');
-
-// The worker is now instantiated with the ioredis connection object.
 const worker = new Worker('sql-execution-queue', processor, { connection });
 
-worker.on('completed', (job, result) => {
+// UPDATED: Event listeners now call both logging functions
+worker.on('completed', async (job, result) => {
   console.log(`[Worker-Event] Job ${job.id} has completed with status: ${result.status}`);
-  updateMonitoringData(job, 'completed');
+  await logJobRunDetailsToMongo(job, result); // Log details to Mongo
+  if (result.status && result.status.includes('errors')) {
+    await updateMonitoringData(job, 'failed');
+  } else {
+    await updateMonitoringData(job, 'completed');
+  }
 });
 
-worker.on('failed', (job, err) => {
+worker.on('failed', async (job, err) => {
   console.error(`[Worker-Event] Job ${job.id} has failed with error: ${err.message}`);
-  updateMonitoringData(job, 'failed');
+  const result = {
+      status: 'Failed',
+      results: [{ error: err.message, timestamp: new Date().toISOString() }]
+  };
+  await logJobRunDetailsToMongo(job, result); // Log failure details to Mongo
+  await updateMonitoringData(job, 'failed');
 });
