@@ -144,10 +144,8 @@ const executeQuery = async (query, dbType, dbConfig, queryId) => {
   }
 };
 
-
-// --- BULLMQ WORKER PROCESSOR (No changes to this section) ---
+// --- BULLMQ WORKER PROCESSOR (UPDATED) ---
 const processor = async (job) => {
-  // ... (This function is unchanged)
   const { s3Key, notebookId } = job.data;
   const file_url = s3Key;
 
@@ -178,7 +176,7 @@ const processor = async (job) => {
     const executionResults = [];
 
     for (const [index, item] of queryObjects.entries()) {
-      const queryToRun = item.query;
+      const queryToRun = item.query; // The SQL text is in this variable
       const queryId = item.id || `query_${index + 1}`;
       const variableName = item.variableName || `result_${index + 1}`;
 
@@ -196,14 +194,17 @@ const processor = async (job) => {
         console.error(`[Worker] ❌ Query ${queryId} failed after ${executionTime}ms. Error: ${result.error}`);
       }
 
+      // --- THE CHANGE IS HERE ---
       executionResults.push({
         queryId,
         variableName,
+        query: queryToRun, // ADDED: Include the actual SQL query text
         success: result.success,
         executionTime,
         error: result.error,
         timestamp: new Date().toISOString()
       });
+      // --------------------------
 
       await sleep(200); 
     }
